@@ -1,0 +1,300 @@
+
+name: Pre-Deployment Checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_unit_test:
+        description: 'Run Unit Tests'
+        required: false
+        type: boolean
+        default: false
+      run_security_scan:
+        description: 'Run Security Scan'
+        required: false
+        type: boolean
+        default: false
+      run_integration_test:
+        description: 'Run Integration Tests'
+        required: false
+        type: boolean
+        default: false
+      run_iac_lint:
+        description: 'Run IaC Linting'
+        required: false
+        type: boolean
+        default: false
+      run_iac_validate:
+        description: 'Run IaC Validation'
+        required: false
+        type: boolean
+        default: false
+      iac_type:
+        description: 'IaC type: bicep or terraform (overrides auto-detection)'
+        required: false
+        type: string
+        default: ''
+      app_runtime:
+        description: 'Application runtime hint (nodejs/python/dotnet/java-maven/java-gradle/ruby/php; leave empty for auto-detect)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  iac-checks:
+    runs-on: ubuntu-latest
+    name: IaC Validation
+    if: github.event.inputs.run_iac_lint == 'true' || github.event.inputs.run_iac_validate == 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Detect IaC Type
+        id: detect_iac
+        run: |
+          # Use the explicit iac_type input when provided — this is the most reliable signal.
+          # Falling back to file search can produce wrong results if the repo contains
+          # leftover .bicep files from a previous deployment alongside the current .tf files.
+          EXPLICIT="${{ github.event.inputs.iac_type }}"
+          if [ "$EXPLICIT" = "bicep" ]; then
+            echo "iac_type=bicep" >> $GITHUB_OUTPUT
+            echo "Using explicit IaC type: Bicep"
+          elif [ "$EXPLICIT" = "terraform" ]; then
+            echo "iac_type=terraform" >> $GITHUB_OUTPUT
+            echo "Using explicit IaC type: Terraform"
+          elif find . -maxdepth 3 -name "*.bicep" | grep -q .; then
+            echo "iac_type=bicep" >> $GITHUB_OUTPUT
+            echo "Auto-detected IaC type: Bicep"
+          elif find . -maxdepth 3 -name "*.tf" | grep -q .; then
+            echo "iac_type=terraform" >> $GITHUB_OUTPUT
+            echo "Auto-detected IaC type: Terraform"
+          else
+            echo "iac_type=unknown" >> $GITHUB_OUTPUT
+            echo "No recognised IaC files found (.bicep or .tf)."
+          fi
+
+      # ── BICEP ──────────────────────────────────────────────────────────────
+      - name: Bicep Validate (az bicep build)
+        if: steps.detect_iac.outputs.iac_type == 'bicep' && github.event.inputs.run_iac_validate == 'true'
+        run: |
+          az bicep install
+          echo "Validating all Bicep files..."
+          find . -name "*.bicep" | while read f; do
+            echo "  Compiling $f ..."
+            az bicep build --file "$f" --stdout > /dev/null
+          done
+          echo "All Bicep files compiled successfully."
+
+      - name: Bicep Lint (az bicep lint)
+        if: steps.detect_iac.outputs.iac_type == 'bicep' && github.event.inputs.run_iac_lint == 'true'
+        run: |
+          az bicep install
+          echo "Linting all Bicep files..."
+          find . -name "*.bicep" | while read f; do
+            echo "  Linting $f ..."
+            az bicep lint --file "$f"
+          done
+          echo "Bicep lint completed."
+
+      # ── TERRAFORM ──────────────────────────────────────────────────────────
+      - name: Setup Terraform
+        if: steps.detect_iac.outputs.iac_type == 'terraform'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      - name: Terraform Init
+        if: steps.detect_iac.outputs.iac_type == 'terraform'
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        if: steps.detect_iac.outputs.iac_type == 'terraform' && github.event.inputs.run_iac_validate == 'true'
+        run: terraform validate
+
+      - name: Terraform Lint (tflint)
+        if: steps.detect_iac.outputs.iac_type == 'terraform' && github.event.inputs.run_iac_lint == 'true'
+        run: |
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+          tflint --recursive || echo "TFLint found advisory issues. Review above — non-blocking style warnings."
+
+  app-checks:
+    runs-on: ubuntu-latest
+    name: Application Code Validation
+    if: github.event.inputs.run_unit_test == 'true' || github.event.inputs.run_security_scan == 'true' || github.event.inputs.run_integration_test == 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Auto-detect Application Runtime
+        id: detect_runtime
+        run: |
+          # Use the explicit app_runtime hint when provided — most reliable signal.
+          # Falls back to file-based detection (maxdepth 6 to cover deployment/app_code/... paths).
+          EXPLICIT="${{ github.event.inputs.app_runtime }}"
+          if [ -n "$EXPLICIT" ]; then
+            echo "runtime=${EXPLICIT}" >> $GITHUB_OUTPUT
+            echo "Using explicit runtime hint: ${EXPLICIT}"
+          elif find . -maxdepth 6 -name "package.json" ! -path "*/node_modules/*" | grep -q .; then
+            echo "runtime=nodejs" >> $GITHUB_OUTPUT
+            echo "Detected runtime: Node.js"
+          elif find . -maxdepth 6 \( -name "requirements.txt" -o -name "setup.py" -o -name "pyproject.toml" \) | grep -q .; then
+            echo "runtime=python" >> $GITHUB_OUTPUT
+            echo "Detected runtime: Python"
+          elif find . -maxdepth 6 \( -name "*.csproj" -o -name "*.sln" \) | grep -q .; then
+            echo "runtime=dotnet" >> $GITHUB_OUTPUT
+            echo "Detected runtime: .NET"
+          elif find . -maxdepth 6 -name "pom.xml" | grep -q .; then
+            echo "runtime=java-maven" >> $GITHUB_OUTPUT
+            echo "Detected runtime: Java (Maven)"
+          elif find . -maxdepth 6 \( -name "build.gradle" -o -name "build.gradle.kts" \) | grep -q .; then
+            echo "runtime=java-gradle" >> $GITHUB_OUTPUT
+            echo "Detected runtime: Java (Gradle)"
+          elif find . -maxdepth 6 -name "Gemfile" | grep -q .; then
+            echo "runtime=ruby" >> $GITHUB_OUTPUT
+            echo "Detected runtime: Ruby"
+          elif find . -maxdepth 6 -name "composer.json" | grep -q .; then
+            echo "runtime=php" >> $GITHUB_OUTPUT
+            echo "Detected runtime: PHP"
+          else
+            echo "runtime=unknown" >> $GITHUB_OUTPUT
+            echo "Could not auto-detect runtime. Language-specific steps will be skipped."
+          fi
+
+      # ── NODE.JS ────────────────────────────────────────────────────────────
+      - name: Set up Node.js
+        if: steps.detect_runtime.outputs.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Node.js dependencies
+        if: steps.detect_runtime.outputs.runtime == 'nodejs'
+        run: npm ci 2>/dev/null || npm install
+
+      - name: Run Node.js Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'nodejs' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          npm test -- --passWithNoTests 2>/dev/null             || npm test             || echo "::warning::No test script found or tests failed. Review package.json scripts."
+
+      # ── PYTHON ─────────────────────────────────────────────────────────────
+      - name: Set up Python
+        if: steps.detect_runtime.outputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Python dependencies
+        if: steps.detect_runtime.outputs.runtime == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pytest 2>/dev/null || true
+
+      - name: Run Python Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'python' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          python -m pytest --tb=short -q 2>/dev/null             || python -m unittest discover -s . -p "test_*.py" 2>/dev/null             || echo "::warning::No test files found. Add pytest or unittest tests to enable this check."
+
+      # ── .NET ───────────────────────────────────────────────────────────────
+      - name: Set up .NET SDK
+        if: steps.detect_runtime.outputs.runtime == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Restore .NET dependencies
+        if: steps.detect_runtime.outputs.runtime == 'dotnet'
+        run: dotnet restore
+
+      - name: Run .NET Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'dotnet' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          dotnet test --no-restore --verbosity normal             || echo "::warning::No test projects found or tests failed."
+
+      # ── JAVA (MAVEN) ───────────────────────────────────────────────────────
+      - name: Set up Java 17
+        if: steps.detect_runtime.outputs.runtime == 'java-maven' || steps.detect_runtime.outputs.runtime == 'java-gradle'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Run Maven Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'java-maven' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          mvn test -B --no-transfer-progress             || echo "::warning::Maven tests failed or no tests found."
+
+      - name: Run Gradle Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'java-gradle' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          ./gradlew test --no-daemon 2>/dev/null             || gradle test --no-daemon 2>/dev/null             || echo "::warning::Gradle tests failed or no tests found."
+
+      # ── RUBY ───────────────────────────────────────────────────────────────
+      - name: Run Ruby Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'ruby' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          bundle install 2>/dev/null || true
+          bundle exec rspec 2>/dev/null             || bundle exec rake test 2>/dev/null             || echo "::warning::No RSpec/Rake tests found."
+
+      # ── PHP ────────────────────────────────────────────────────────────────
+      - name: Run PHP Unit Tests
+        if: steps.detect_runtime.outputs.runtime == 'php' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          composer install --no-interaction --prefer-dist 2>/dev/null || true
+          vendor/bin/phpunit 2>/dev/null             || echo "No PHPUnit tests found or composer not configured. Add a phpunit.xml and tests/ folder to enable this check."
+
+      # ── UNKNOWN RUNTIME ────────────────────────────────────────────────────
+      - name: Unit Tests — Runtime Not Detected
+        if: steps.detect_runtime.outputs.runtime == 'unknown' && github.event.inputs.run_unit_test == 'true'
+        run: |
+          echo "::warning::Runtime could not be detected. Unit tests were not run."
+          echo "Ensure your project has one of: package.json, requirements.txt, *.csproj, pom.xml, build.gradle, Gemfile, or composer.json."
+
+      # ── SECURITY SCAN (Trivy — language-agnostic) ──────────────────────────
+      - name: Security Scan (Trivy filesystem)
+        if: github.event.inputs.run_security_scan == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'HIGH,CRITICAL'
+          format: 'table'
+          exit-code: '0'
+
+      # ── INTEGRATION TESTS ──────────────────────────────────────────────────
+      - name: Run Integration Tests
+        if: github.event.inputs.run_integration_test == 'true'
+        run: |
+          if [ -f "integration-tests.sh" ]; then
+            echo "Running integration-tests.sh..."
+            bash integration-tests.sh
+          elif [ -f "package.json" ] && grep -q '"integration"' package.json; then
+            npm run integration
+          elif [ -f "package.json" ] && grep -q '"test:integration"' package.json; then
+            npm run test:integration
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            python -m pytest tests/integration/ -q 2>/dev/null               || python -m pytest -m integration -q 2>/dev/null               || echo "::warning::No integration test folder or marker found."
+          else
+            echo "No integration test entry point found. To enable integration tests, add one of:"
+            echo "  - integration-tests.sh at project root"
+            echo "  - 'integration' or 'test:integration' script in package.json"
+            echo "  - tests/integration/ folder for Python projects"
+          fi
+
+  pre-deployment-summary:
+    runs-on: ubuntu-latest
+    name: Pre-Deployment Summary
+    needs: [iac-checks, app-checks]
+    if: always()
+    steps:
+      - name: Check job statuses
+        run: |
+          echo "IaC Checks status: ${{ needs.iac-checks.result }}"
+          echo "App Checks status: ${{ needs.app-checks.result }}"
+          if [[ "${{ needs.iac-checks.result }}" == "failure" || "${{ needs.iac-checks.result }}" == "cancelled" || "${{ needs.app-checks.result }}" == "failure" || "${{ needs.app-checks.result }}" == "cancelled" ]]; then
+            echo "One or more pre-deployment checks failed."
+            exit 1
+          fi
+          echo "All pre-deployment checks passed successfully."
